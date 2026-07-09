@@ -38,12 +38,30 @@ Claude 完成一轮 → Stop Hook 触发
                    └─ Claude 可以修正后重试（stop_hook_active=true）
 ```
 
+## 快速开始
+
+```bash
+git clone <repo-url>
+cd Claude-Lab
+cp .claude/settings.local.example.json .claude/settings.local.json
+```
+
+配置完成。确保已安装 Python 3，随后正常使用 Claude Code 即可。
+首次触发 Stop 时会弹出权限确认，允许后 Hook 即生效。
+
 ## 配置
 
 ### 注册 Hook
 
-在 `.claude/settings.local.json`（项目级）或 `~/.claude/settings.json`
-（用户级）中添加：
+仓库提供了开箱即用的示例配置 `.claude/settings.local.example.json`，
+直接复制即可，无需手动编写：
+
+```bash
+cp .claude/settings.local.example.json .claude/settings.local.json
+```
+
+也可以手动在 `.claude/settings.local.json`（项目级）或
+`~/.claude/settings.json`（用户级）中添加：
 
 ```json
 {
