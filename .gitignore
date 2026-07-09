@@ -1,0 +1,12 @@
+# Local settings (may contain personal paths/permissions)
+.claude/settings.local.json
+
+# Runtime state
+.claude/.file_state.json
+
+# Debug log
+.claude/hook.log
+
+# Python bytecode
+__pycache__/
+*.pyc
