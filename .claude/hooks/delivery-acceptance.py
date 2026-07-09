@@ -56,7 +56,6 @@ BASH_CMD_MARKERS = [
     '"command":"pylint',
     '"command":"eslint',
     '"command":"black --check',
-    '"command":"ruff check',
     # Typecheck
     '"command":"mypy',
     '"command":"pyright',
@@ -171,7 +170,14 @@ def detect_available_tools(project_root: str) -> List[Tuple[str, str, str]]:
             if not any(t[1] == "eslint" for t in found):
                 found.append(("lint", "eslint", "npx eslint ."))
 
-    return found
+    # ── Deduplicate by tool name (keep first occurrence) ──
+    seen: set[str] = set()
+    deduped: List[Tuple[str, str, str]] = []
+    for category, tool, cmd in found:
+        if tool not in seen:
+            seen.add(tool)
+            deduped.append((category, tool, cmd))
+    return deduped
 
 
 def get_suggested_minimal_checks(project_root: str) -> List[str]:

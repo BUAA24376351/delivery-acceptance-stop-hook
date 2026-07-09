@@ -14,8 +14,8 @@ from datetime import datetime
 from pathlib import Path
 
 
-HOOK_SCRIPT = Path("D:/Claude-Lab/.claude/hooks/delivery-acceptance.py")
-PROJECT_ROOT = "D:/Claude-Lab"
+HOOK_SCRIPT = Path(__file__).resolve().parent / ".claude" / "hooks" / "delivery-acceptance.py"
+PROJECT_ROOT = str(Path(__file__).resolve().parent)
 
 
 def simulate_stop(cwd: str, transcript_path: str, is_retry: bool = False) -> subprocess.CompletedProcess:
