@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Delivery Acceptance Stop Hook for Claude Code — v1.0.0
+Delivery Acceptance Stop Hook for Claude Code — v1.1.0
 
 Triggers on Stop event. Checks whether:
 1. Files were modified (via git status, or file-timestamp tracking for non-git,
@@ -32,54 +32,307 @@ from typing import List, Tuple
 DEBUG = False
 
 
-# ── Verification patterns that indicate actual tool execution ──────────
-# These match against the raw transcript JSONL content (compact JSON format,
-# no spaces after colons: "command":"pytest" not "command": "pytest").
-# They target Bash tool commands (not chat text) for reliability.
+# ── Verification command classification ───────────────────────────────
+#
+# Design: 5-layer classifier instead of a flat whitelist of full command
+# strings.  Each layer answers a different question about the command:
+#
+#   Layer 1 — Known verification TOOLS (proper nouns):
+#     Tools whose primary purpose is testing/linting/typechecking.
+#     Running them IS verification regardless of arguments.
+#     A whitelist is NECESSARY here because these are proper nouns —
+#     no pattern can distinguish "pytest" (test runner) from "random_tool".
+#
+#   Layer 2 — Test-file execution PATTERNS:
+#     Running a test file directly (python test_*.py, node *.test.js,
+#     python -m unittest, etc.).  Pattern-based because filename
+#     conventions are structural, not proper nouns.
+#
+#   Layer 3 — Inline code verification:
+#     python -c "...", node --check, node -e "...", ruby -c, perl -c.
+#
+#   Layer 4 — Package manager test scripts:
+#     npm test, pnpm test, yarn test, bun test, make test, etc.
+#
+#   Layer 5 — TODO/FIXME scans:
+#     grep/rg/find/ag/ack for todo/fixme/hack/xxx patterns.
+#
+# Safety: ordinary commands (ls, echo, pwd, cd, cat, git, etc.) match
+# NONE of these layers, so they cannot be misclassified as verification.
 
-BASH_CMD_MARKERS = [
-    # Test frameworks
-    '"command":"pytest',
-    '"command":"npm test',
-    '"command":"go test',
-    '"command":"cargo test',
-    '"command":"jest',
-    '"command":"mocha',
-    '"command":"unittest',
-    '"command":"tox',
-    '"command":"nosetests',
-    '"command":"python -m pytest',
-    '"command":"npx jest',
-    # Lint
-    '"command":"ruff check',
-    '"command":"flake8',
-    '"command":"pylint',
-    '"command":"eslint',
-    '"command":"black --check',
-    # Typecheck
-    '"command":"mypy',
-    '"command":"pyright',
-    '"command":"tsc --noEmit',
-    '"command":"tsc --no-emit',
-    '"command":"npx tsc',
-    # Minimal / ad-hoc verification (matched by get_suggested_minimal_checks)
-    '"command":"python -c',        # python -c "import ast; ast.parse(...)" etc.
-    '"command":"node --check',     # node --check <file>
-]
-BASH_CMD_MARKERS_LOWER = [m.lower() for m in BASH_CMD_MARKERS]
 
-TODO_MARKERS = [
-    # Regex patterns matching actual Bash tool invocations, not conversation text
-    # Uses re.search so .* matches any characters.
-    r'"command":"grep.*todo',
-    r'"command":"grep.*fixme',
-    r'"command":"rg .*todo',
-    r'"command":"rg .*fixme',
-    r'"command":"find.*todo',
-    r'"command":"ag .*todo',
-    r'"command":"ack .*todo',
+# ── Layer 1: Known verification tools ─────────────────────────────────
+# Organized by ecosystem.  Each entry is a tool name or "tool + first
+# argument" pair.  Matching is prefix-based: a command matches if it
+# starts with the entry (followed by space, end-of-string, or "; " for
+# chained commands).
+#
+# To add a new tool, simply append its name to this list.
+
+_VERIFICATION_TOOLS = [
+    # ── Python: test frameworks ──
+    'pytest', 'tox', 'nox', 'nosetests',
+    # ── Python: linters ──
+    'ruff check', 'flake8', 'pylint', 'pycodestyle',
+    'pydocstyle', 'bandit', 'vulture', 'ruff',
+    # ── Python: type checkers ──
+    'mypy', 'pyright',
+    # ── Python: format check ──
+    'black --check', 'isort --check', 'isort --check-only',
+    # ── JS/TS: test frameworks ──
+    'jest', 'mocha', 'jasmine', 'ava', 'vitest',
+    'cypress', 'playwright', 'web-test-runner',
+    # ── JS/TS: linters ──
+    'eslint', 'stylelint', 'xo',
+    # ── JS/TS: format check ──
+    'prettier --check',
+    # ── TS: type checker (also handled via patterns below) ──
+    'tsc --noemit', 'tsc --no-emit',
+    # ── Go ──
+    'go test', 'go vet', 'go build',
+    # ── Rust ──
+    'cargo test', 'cargo clippy', 'cargo check', 'cargo build',
+    # ── Deno ──
+    'deno test', 'deno lint', 'deno check',
+    # ── Shell / Docker ──
+    'shellcheck', 'hadolint',
+    # ── Build-system test targets ──
+    'make test', 'make check', 'ninja test', 'ctest',
 ]
-TODO_MARKERS_LOWER = [m.lower() for m in TODO_MARKERS]
+
+# ── Layer 2: Test-file execution helpers ──────────────────────────────
+
+# Extensions recognised as code files when checking test-file patterns.
+_CODE_EXTS = frozenset({
+    '.py', '.pyw', '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs',
+    '.go', '.rs', '.rb', '.php', '.swift', '.java', '.kt',
+})
+
+# Regex matching "test" as a distinct word component in a filename.
+#   test_foo     ✓   (prefix, followed by _)
+#   foo_test     ✓   (suffix, preceded by _)
+#   foo.test     ✓   (suffix, preceded by .)
+#   foo-test     ✓   (suffix, preceded by -)
+#   testing      ✗   (no boundary after "test")
+#   contest      ✗   (no boundary before "test")
+#   latest       ✗   (embedded, no boundary at all)
+_TEST_WORD_RE = re.compile(r'(?:^|[_.-])test(?:$|[_.-])', re.IGNORECASE)
+
+# Python interpreters that may run a test file / test module directly.
+_PY_INTERPRETERS = ('python', 'python3', 'python2', 'py')
+
+# Python test modules invoked via `-m` (e.g. python -m pytest, python -m unittest).
+_PY_TEST_MODULES = ('pytest', 'unittest', 'nose', 'pytest-cov')
+
+# ── Layer 4: Package-manager / build-system test scripts ──────────────
+
+# Script names in package.json, Makefile, etc. whose execution signals
+# verification intent.  Matched as the sub-command after the package
+# manager:  `npm run <name>` or `<pm> <name>` (for shorthand forms).
+_VERIFY_SCRIPT_NAMES = frozenset({
+    'test', 't', 'lint', 'typecheck', 'check-types',
+    'verify', 'ci', 'e2e', 'integration', 'check',
+})
+
+# Package managers that support `run <script>` and/or `<script>` shorthand.
+_PM_RUNNERS = {
+    'npm': 'run',      # npm test, npm run test:unit
+    'pnpm': 'run',     # pnpm test, pnpm run lint
+    'yarn': 'run',     # yarn test, yarn run typecheck
+    'bun': 'run',      # bun test, bun run lint
+}
+
+# ── Layer 5: TODO/FIXME scan patterns ─────────────────────────────────
+
+# Search tools commonly used to scan code for leftover markers.
+_TODO_SEARCH_TOOLS = ('grep', 'rg', 'find', 'ag', 'ack', 'git grep')
+
+# Keywords that signal a TODO/FIXME scan (case-insensitive match).
+_TODO_KEYWORDS = ('todo', 'fixme', 'hack', 'xxx', 'bug', 'workaround')
+
+
+# ── Runner prefix stripping ───────────────────────────────────────────
+
+# Tool runner prefixes (with trailing space) that wrap the actual command.
+# When a command starts with one of these, we strip it and re-classify
+# the remainder.  This catches:
+#   uv run pytest        → pytest       (Layer 1)
+#   poetry run python -m pytest → python -m pytest (Layer 2)
+#   npx vitest           → vitest       (Layer 1)
+_RUNNER_PREFIXES = (
+    'uv run ', 'poetry run ', 'pipenv run ',
+    'npx ', 'pnpm exec ', 'yarn exec ', 'bun exec ',
+)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Core classifier
+# ═══════════════════════════════════════════════════════════════════════
+
+def is_verification_command(command: str) -> Tuple[bool, str]:
+    """Classify a single Bash command.
+
+    Returns (is_verification, evidence_label) where evidence_label is a
+    short human-readable category used for logging / debug output.
+    """
+    cmd = command.strip()
+    if not cmd:
+        return False, ''
+
+    # Normalise to lower-case and collapse whitespace so patterns are
+    # insensitive to spacing (e.g. "go  test" → "go test").
+    cmd_norm = ' '.join(cmd.lower().split())
+
+    # ── Step 0: Strip known tool-runner prefixes and re-check ─────────
+    for prefix in _RUNNER_PREFIXES:
+        if cmd_norm.startswith(prefix):
+            sub_cmd = cmd_norm[len(prefix):]
+            ok, cat = is_verification_command(sub_cmd)
+            if ok:
+                return True, f'runner+{cat}'
+            return False, ''
+
+    # ── Layer 1: Known verification tools ─────────────────────────────
+    for tool in _VERIFICATION_TOOLS:
+        if cmd_norm == tool:
+            return True, tool
+        if cmd_norm.startswith(tool + ' ') or cmd_norm.startswith(tool + ';'):
+            return True, tool
+
+    # ── Layer 2: Test-file execution patterns ─────────────────────────
+    tokens = cmd_norm.split()
+    if not tokens:
+        return False, ''
+
+    exe = tokens[0]
+    args = tokens[1:]
+
+    # 2a — Python: python test_*.py, python -m pytest, python -m unittest …
+    if exe in _PY_INTERPRETERS or exe.startswith('python') and exe.replace('python', '').replace('.', '').replace('3', '').replace('2', '').isdigit():
+        # python<N>[.M] — check for flags & file args
+        flag_args = []
+        pos_args = []
+        for i, a in enumerate(args):
+            if a.startswith('-') and a != '-m':
+                flag_args.append(a)
+            elif flag_args and not a.startswith('-') and flag_args[-1] in ('-c', '-W'):
+                # Consume the value of the previous flag
+                flag_args.append(a)
+            else:
+                pos_args.append(a)
+
+        # python -c "…" (inline code execution = ad-hoc verification)
+        if '-c' in flag_args:
+            return True, 'python -c'
+
+        # python -m pytest / python -m unittest …
+        if '-m' in pos_args or '-m' in flag_args:
+            try:
+                m_idx = (pos_args + flag_args).index('-m')
+                combined = pos_args + flag_args
+                if m_idx + 1 < len(combined):
+                    module = combined[m_idx + 1].split('.')[0]
+                    if module in _PY_TEST_MODULES:
+                        return True, f'python -m {module}'
+            except ValueError:
+                pass
+
+        # python test_*.py / python *_test.py …
+        for a in pos_args:
+            if a == '-m':
+                continue  # handled above
+            # Check if it looks like a file path with recognised extension
+            _, ext = os.path.splitext(a)
+            if ext.lower() in _CODE_EXTS:
+                stem = os.path.basename(a)
+                stem_no_ext = os.path.splitext(stem)[0]
+                if _TEST_WORD_RE.search(stem_no_ext):
+                    return True, f'python test-file: {os.path.basename(a)}'
+                # Also match when file is inside a test/ or tests/ directory
+                parent = os.path.basename(os.path.dirname(a))
+                if parent.lower() in ('test', 'tests'):
+                    return True, f'python file in test-dir: {os.path.basename(a)}'
+
+    # 2b — Node / Deno: node test_*.js, node *.test.js, node *.spec.js …
+    if exe in ('node', 'nodejs'):
+        for a in args:
+            if a.startswith('-'):
+                continue
+            stem = os.path.splitext(os.path.basename(a))[0]
+            if _TEST_WORD_RE.search(stem):
+                return True, f'node test-file: {os.path.basename(a)}'
+            if re.search(r'(?:^|[_.-])(?:spec|e2e)(?:$|[_.-])', stem, re.IGNORECASE):
+                return True, f'node spec-file: {os.path.basename(a)}'
+            parent = os.path.basename(os.path.dirname(a))
+            if parent.lower() in ('test', 'tests', 'spec', '__tests__'):
+                return True, f'node file in test-dir: {os.path.basename(a)}'
+
+    # 2c — Go: go test ./... (already covered by Layer 1, but belt-and-suspenders)
+    if exe == 'go':
+        if args and args[0] == 'test':
+            return True, 'go test'
+
+    # 2d — Rust: cargo test (already covered by Layer 1)
+    if exe == 'cargo':
+        if args and args[0] in ('test', 'clippy', 'check', 'build'):
+            return True, f'cargo {args[0]}'
+
+    # ── Layer 3: Inline code verification ─────────────────────────────
+    # python -c "…" (already handled in 2a above)
+
+    # node --check <file>
+    if exe == 'node' and '--check' in args:
+        return True, 'node --check'
+
+    # node -e "…" (inline JS execution)
+    if exe == 'node' and '-e' in args:
+        return True, 'node -e'
+
+    # ruby -c <file>
+    if exe == 'ruby' and '-c' in args:
+        return True, 'ruby -c'
+
+    # perl -c <file>
+    if exe == 'perl' and '-c' in args:
+        return True, 'perl -c'
+
+    # ── Layer 4: Package manager test scripts ─────────────────────────
+    if exe in _PM_RUNNERS:
+        subcmd = args[0] if args else ''
+        # Shorthand: npm test, pnpm test, yarn lint …
+        if subcmd in _VERIFY_SCRIPT_NAMES:
+            return True, f'{exe} {subcmd}'
+        # Explicit: npm run test, pnpm run lint, yarn run test:unit …
+        if subcmd == 'run' and len(args) >= 2:
+            script = args[1].split(':')[0]  # "test:unit" → "test"
+            if script in _VERIFY_SCRIPT_NAMES:
+                return True, f'{exe} run {args[1]}'
+
+    # make test, make check
+    if exe == 'make':
+        if args and args[0] in _VERIFY_SCRIPT_NAMES:
+            return True, f'make {args[0]}'
+
+    # ninja test
+    if exe == 'ninja':
+        if args and args[0] in _VERIFY_SCRIPT_NAMES:
+            return True, f'ninja {args[0]}'
+
+    # ── Layer 5: TODO/FIXME scans ─────────────────────────────────────
+    # Check single-word tools (grep, rg, ag, ack, find) and two-word
+    # tools (git grep) by also checking exe+args[0] combined.
+    matched_tool = ''
+    if exe in _TODO_SEARCH_TOOLS:
+        matched_tool = exe
+    elif args and f'{exe} {args[0]}' in _TODO_SEARCH_TOOLS:
+        matched_tool = f'{exe} {args[0]}'
+    if matched_tool:
+        cmd_joined = ' '.join(args).lower()
+        for kw in _TODO_KEYWORDS:
+            if kw in cmd_joined:
+                return True, f'{matched_tool} scan: {kw}'
+
+    return False, ''
 
 # ── Session-work markers ────────────────────────────────────────────────
 # Fallback when file-scan sees no mtime delta (baseline already synced).
@@ -415,34 +668,73 @@ def check_transcript_for_session_work(transcript_path: str) -> bool:
     return False
 
 
-def check_transcript_for_verification(transcript_path: str) -> Tuple[bool, str]:
-    """
-    Scan the transcript JSONL for actual verification tool executions.
+def _extract_bash_commands(transcript_path: str) -> List[str]:
+    """Extract Bash tool commands from transcript JSONL.
 
-    Uses streaming reads (bounded to 2 MB of tail content) to avoid
-    loading large files into memory. Pre-lowered markers skip redundant
-    .lower() calls in the hot loop.
+    Handles two transcript formats:
+
+    1. Flat (mock tests):
+       ``{"type":"tool_use","name":"Bash","input":{"command":"..."}}``
+    2. Nested (real Claude Code transcript):
+       ``{"type":"assistant","message":{"content":[{"type":"tool_use",...}]}}``
+
+    Reads only the last 2 MB of the transcript (same trade-off as
+    ``_read_transcript_tail``) to keep memory bounded.
+    """
+    commands: List[str] = []
+    try:
+        file_size = os.path.getsize(transcript_path)
+    except OSError:
+        return commands
+
+    read_size = min(file_size, 2 * 1024 * 1024)
+    try:
+        with open(transcript_path, "r", encoding="utf-8", errors="replace") as fh:
+            if file_size > read_size:
+                fh.seek(file_size - read_size)
+                fh.readline()  # discard partial first line after seek
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                # Collect tool_use items from both formats
+                tool_uses = []
+                if rec.get("type") == "tool_use":
+                    tool_uses.append(rec)
+                for ci in rec.get("message", {}).get("content", []):
+                    if isinstance(ci, dict) and ci.get("type") == "tool_use":
+                        tool_uses.append(ci)
+                for tu in tool_uses:
+                    if tu.get("name") == "Bash":
+                        cmd = tu.get("input", {}).get("command", "")
+                        if cmd and isinstance(cmd, str):
+                            commands.append(cmd)
+    except Exception:
+        pass
+
+    return commands
+
+
+def check_transcript_for_verification(transcript_path: str) -> Tuple[bool, str]:
+    """Scan the transcript JSONL for actual verification tool executions.
+
+    Uses JSONL parsing to extract Bash commands, then classifies each one
+    with ``is_verification_command()``.  Returns ``(True, evidence)`` as
+    soon as *any* command in the recent transcript qualifies as verification.
 
     Returns (verified, evidence_description).
     """
-    content_lower = _read_transcript_tail(transcript_path)
-    if not content_lower:
-        return False, ""
-
-    # Check for Bash tool calls with verification commands
-    for pattern in BASH_CMD_MARKERS_LOWER:
-        idx = content_lower.find(pattern)
-        if idx != -1:
-            start = max(0, idx - 60)
-            end = min(len(content_lower), idx + 80)
-            snippet = content_lower[start:end].replace("\n", " ").strip()
-            return True, snippet
-
-    # Check for TODO/FIXME scans (regex because markers use .* patterns)
-    for pattern in TODO_MARKERS_LOWER:
-        if re.search(pattern, content_lower):
-            return True, "TODO/FIXME 扫描已执行"
-
+    commands = _extract_bash_commands(transcript_path)
+    for cmd in commands:
+        ok, category = is_verification_command(cmd)
+        if ok:
+            # Truncate command for readable evidence snippet
+            snippet = cmd[:120] + ("…" if len(cmd) > 120 else "")
+            return True, f"{category}: {snippet}"
     return False, ""
 
 

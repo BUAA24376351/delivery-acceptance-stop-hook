@@ -6,7 +6,6 @@ Stop Hook 验收测试 (v2)
 """
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -78,6 +77,66 @@ def create_mock_transcript(contains_verification: bool) -> str:
 
         f.write('{"role":"user","content":"改完了"}\n')
 
+    return path
+
+
+def create_transcript_with_commands(commands: list, include_write: bool = True) -> str:
+    """Create a mock transcript JSONL containing specific Bash commands.
+
+    Uses the **real** Claude Code transcript format where tool_use records
+    are nested inside ``message.content[]`` (not the flat test format).
+
+    Args:
+        commands: List of Bash command strings to include in the transcript.
+        include_write: If True, also includes a Write tool call so the
+                       session-work fallback detects changes.
+
+    Returns:
+        Path to the temporary transcript file (caller should unlink).
+    """
+    import uuid as _uuid
+
+    def _make_assistant_line(tool_uses):
+        """Build one assistant-type JSONL line with nested tool_use entries."""
+        content = []
+        for tu_name, tu_input in tool_uses:
+            content.append({
+                "type": "tool_use",
+                "id": "call_%s" % _uuid.uuid4().hex[:12],
+                "name": tu_name,
+                "input": tu_input,
+            })
+        rec = {
+            "type": "assistant",
+            "message": {
+                "id": "msg_%s" % _uuid.uuid4().hex[:12],
+                "type": "message",
+                "role": "assistant",
+                "model": "claude",
+                "content": content,
+            },
+        }
+        return json.dumps(rec, ensure_ascii=False)
+
+    fd, path = tempfile.mkstemp(suffix=".jsonl", prefix="mock_transcript_")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write('{"role":"user","content":"帮我改代码"}\n')
+        f.write('{"role":"assistant","content":"好的"}\n')
+        # Read tool call
+        f.write(_make_assistant_line([
+            ("Read", {"file_path": "app.py"}),
+        ]) + "\n")
+        # Write tool call (triggers session-work detection)
+        if include_write:
+            f.write(_make_assistant_line([
+                ("Write", {"file_path": "app.py", "content": "..."}),
+            ]) + "\n")
+        # Bash commands — one per line (as in real transcripts)
+        for cmd in commands:
+            f.write(_make_assistant_line([
+                ("Bash", {"command": cmd, "description": "run command"}),
+            ]) + "\n")
+        f.write('{"role":"user","content":"改完了"}\n')
     return path
 
 
@@ -221,21 +280,300 @@ def main():
         os.unlink(transcript)
 
     # ═══════════════════════════════════════════════════════════════
+    # 场景 7：python test_*.py 直接执行测试文件 → 应放行
+    # 验证新分类器 Layer 2 的文件名模式匹配
+    # ═══════════════════════════════════════════════════════════════
+    with tempfile.TemporaryDirectory(prefix="hook_test_pyfile_") as working_dir:
+        test_file = create_test_code_file(working_dir, "app.py")
+        transcript = create_transcript_with_commands(
+            ["python test_calculator.py", "ls -la"]
+        )
+        proc = simulate_stop(cwd=working_dir, transcript_path=transcript)
+        print_scenario(7, "python test_*.py 测试文件执行 → 应放行", proc)
+        analyze_path(7, proc,
+                     "transcript 含 python test_calculator.py → Layer 2 test-file 匹配 → exit 0")
+        os.unlink(transcript)
+
+    # ═══════════════════════════════════════════════════════════════
+    # 场景 8：uv run / poetry run / pipenv run → 应放行
+    # 验证 runner prefix stripping + Layer 1 工具匹配
+    # ═══════════════════════════════════════════════════════════════
+    with tempfile.TemporaryDirectory(prefix="hook_test_runner_") as working_dir:
+        test_file = create_test_code_file(working_dir, "app.py")
+        transcript = create_transcript_with_commands([
+            "uv run pytest -v",
+            "ls -la",
+            "echo done",
+        ])
+        proc = simulate_stop(cwd=working_dir, transcript_path=transcript)
+        print_scenario(8, "uv run pytest → 应放行 (runner prefix strip)", proc)
+        analyze_path(8, proc,
+                     "transcript 含 uv run pytest → strip uv run → pytest 匹配 Layer 1 → exit 0")
+        os.unlink(transcript)
+
+    # ═══════════════════════════════════════════════════════════════
+    # 场景 9：pnpm test / bun test → 应放行
+    # 验证 Layer 4 包管理器测试脚本
+    # ═══════════════════════════════════════════════════════════════
+    with tempfile.TemporaryDirectory(prefix="hook_test_pnpm_") as working_dir:
+        test_file = create_test_code_file(working_dir, "app.py")
+        transcript = create_transcript_with_commands(["pnpm test"])
+        proc = simulate_stop(cwd=working_dir, transcript_path=transcript)
+        print_scenario(9, "pnpm test → 应放行 (Layer 4)", proc)
+        analyze_path(9, proc,
+                     "transcript 含 pnpm test → Layer 4 包管理器脚本匹配 → exit 0")
+        os.unlink(transcript)
+
+    # ═══════════════════════════════════════════════════════════════
+    # 场景 10：python -m unittest discover → 应放行
+    # 验证 Layer 2 的 -m <test_module> 模式匹配
+    # ═══════════════════════════════════════════════════════════════
+    with tempfile.TemporaryDirectory(prefix="hook_test_unittest_") as working_dir:
+        test_file = create_test_code_file(working_dir, "app.py")
+        transcript = create_transcript_with_commands(
+            ["python -m unittest discover -s tests"]
+        )
+        proc = simulate_stop(cwd=working_dir, transcript_path=transcript)
+        print_scenario(10, "python -m unittest discover → 应放行", proc)
+        analyze_path(10, proc,
+                     "transcript 含 python -m unittest → Layer 2 test module 匹配 → exit 0")
+        os.unlink(transcript)
+
+    # ═══════════════════════════════════════════════════════════════
+    # 场景 11：npm install / git status / cat → 应拦截
+    # 验证普通命令不会误判为验证 (安全性回归)
+    # ═══════════════════════════════════════════════════════════════
+    with tempfile.TemporaryDirectory(prefix="hook_test_safety_") as working_dir:
+        test_file = create_test_code_file(working_dir, "app.py")
+        transcript = create_transcript_with_commands([
+            "npm install",
+            "git status",
+            "cat README.md",
+        ])
+        proc = simulate_stop(cwd=working_dir, transcript_path=transcript)
+        print_scenario(11, "npm install / git status / cat → 应拦截 (安全性)", proc)
+        analyze_path(11, proc,
+                     "npm install → 不是 test/lint 脚本; git/cat → 不匹配任何层 → exit 2")
+        os.unlink(transcript)
+
+    # ═══════════════════════════════════════════════════════════════
+    # 场景 12：python main.py (含 Write 但无 test 关键词) → 应拦截
+    # 验证 "contest.py" / "latest.py" 等不会触发子串匹配
+    # ═══════════════════════════════════════════════════════════════
+    with tempfile.TemporaryDirectory(prefix="hook_test_nottest_") as working_dir:
+        test_file = create_test_code_file(working_dir, "app.py")
+        transcript = create_transcript_with_commands([
+            "python main.py",
+            "python contest.py",
+            "python latest.py",
+        ])
+        proc = simulate_stop(cwd=working_dir, transcript_path=transcript)
+        print_scenario(12, "python main.py / contest.py (无 test 词边界) → 应拦截", proc)
+        analyze_path(12, proc,
+                     "contest.py 含 'test' 但不是词边界 → 不匹配 Layer 2 → exit 2")
+        os.unlink(transcript)
+
+    # ═══════════════════════════════════════════════════════════════
+    # 分类器单元测试
+    # ═══════════════════════════════════════════════════════════════
+    run_classifier_unit_tests()
+
+    # ═══════════════════════════════════════════════════════════════
     # 总结
     # ═══════════════════════════════════════════════════════════════
     print("=" * 62)
-    print("  测试总结")
+    print("  测试总结 (集成测试)")
     print("=" * 62)
     print(f"""
-  {'场景 1: 无变更 → 放行':.<45} ...
-  {'场景 2: 有变更+无验证 → 拦截':.<45} ...
-  {'场景 3: 有变更+有验证 → 放行':.<45} ...
-  {'场景 4: 仅 ls/echo → 拦截 (exit_code:0 bug 回归)':.<45} ...
-  {'场景 5: 重试拦截 (语气加强)':.<45} ...
-  {'场景 6: 重试放行':.<45} ...
+  {'场景 1: 无变更 → 放行':.<50} ...
+  {'场景 2: 有变更+无验证 → 拦截':.<50} ...
+  {'场景 3: 有变更+有验证(pytest) → 放行':.<50} ...
+  {'场景 4: 仅 ls/echo → 拦截 (exit_code:0 bug 回归)':.<50} ...
+  {'场景 5: 重试拦截 (语气加强)':.<50} ...
+  {'场景 6: 重试放行':.<50} ...
+  ── 新场景 ──
+  {'场景 7: python test_*.py → 放行 (Layer 2)':.<50} ...
+  {'场景 8: uv run pytest → 放行 (runner strip)':.<50} ...
+  {'场景 9: pnpm test → 放行 (Layer 4)':.<50} ...
+  {'场景 10: python -m unittest → 放行 (Layer 2)':.<50} ...
+  {'场景 11: npm install/git/cat → 拦截 (安全)':.<50} ...
+  {'场景 12: python main.py → 拦截 (非测试)':.<50} ...
 """)
-    print("  （结果见上方各场景输出）")
+    print("  （结果见上方各场景输出 + 下方分类器单元测试）")
     print("=" * 62)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 分类器单元测试 — 直接测试 is_verification_command()
+# ═══════════════════════════════════════════════════════════════════
+
+def run_classifier_unit_tests():
+    """Directly test is_verification_command() against ~40 commands.
+
+    Imports the function from the hook script via importlib so we test
+    the actual production code, not a copy.
+    """
+    import importlib.util
+
+    # Load the hook module
+    spec = importlib.util.spec_from_file_location(
+        "delivery_acceptance", str(HOOK_SCRIPT)
+    )
+    hook_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hook_mod)
+    is_verif = hook_mod.is_verification_command
+
+    # (command, expected_verdict, description)
+    cases = [
+        # ── Layer 1: Known tools ──────────────────────────────────
+        ("pytest", True, "pytest bare"),
+        ("pytest -v --tb=short", True, "pytest with flags"),
+        ("jest --coverage", True, "jest"),
+        ("mocha --reporter spec", True, "mocha"),
+        ("vitest run", True, "vitest"),
+        ("cypress run", True, "cypress"),
+        ("playwright test", True, "playwright"),
+        ("ruff check .", True, "ruff check"),
+        ("flake8 src/", True, "flake8"),
+        ("eslint . --fix", True, "eslint"),
+        ("mypy src/", True, "mypy"),
+        ("pyright --outputjson", True, "pyright"),
+        ("black --check .", True, "black --check"),
+        ("prettier --check '**/*.ts'", True, "prettier --check"),
+        ("go test ./...", True, "go test"),
+        ("go vet ./...", True, "go vet"),
+        ("go build ./cmd/...", True, "go build"),
+        ("cargo test", True, "cargo test"),
+        ("cargo clippy --all-targets", True, "cargo clippy"),
+        ("cargo check", True, "cargo check"),
+        ("cargo build --release", True, "cargo build"),
+        ("deno test", True, "deno test"),
+        ("deno lint", True, "deno lint"),
+        ("deno check main.ts", True, "deno check"),
+        ("shellcheck script.sh", True, "shellcheck"),
+        ("make test", True, "make test"),
+        ("make check", True, "make check"),
+        ("ninja test", True, "ninja test"),
+        ("tox", True, "tox"),
+        ("nox", True, "nox"),
+        ("nosetests", True, "nosetests"),
+        ("tsc --noEmit", True, "tsc --noEmit"),
+        ("tsc --no-emit", True, "tsc --no-emit"),
+
+        # ── Layer 2: Test-file execution ──────────────────────────
+        ("python test_calculator.py", True, "python test_*.py"),
+        ("python3 test_app.py", True, "python3 test_*.py"),
+        ("python calculator_test.py", True, "python *_test.py"),
+        ("python tests/test_foo.py", True, "python tests/*.py (dir)"),
+        ("py test_thing.py", True, "Windows py launcher"),
+        ("python -m pytest -v", True, "python -m pytest"),
+        ("python -m unittest discover", True, "python -m unittest"),
+        ("python -m unittest test_module", True, "python -m unittest mod"),
+        ("node test_app.js", True, "node test_*.js"),
+        ("node app.test.js", True, "node *.test.js"),
+        ("node app.spec.js", True, "node *.spec.js"),
+        ("node __tests__/app.js", True, "node __tests__/*.js"),
+        ("node -e 'require(\"./test\")'", True, "node -e (inline)"),
+
+        # ── Layer 3: Inline verification ──────────────────────────
+        ("python -c \"import ast; ast.parse(open('f').read())\"", True, "python -c"),
+        ("python3 -c \"print('hello')\"", True, "python3 -c"),
+        ("node --check app.js", True, "node --check"),
+        ("ruby -c script.rb", True, "ruby -c"),
+        ("perl -c script.pl", True, "perl -c"),
+
+        # ── Layer 4: Package manager scripts ──────────────────────
+        ("npm test", True, "npm test"),
+        ("npm run test", True, "npm run test"),
+        ("npm run test:unit", True, "npm run test:unit"),
+        ("npm run lint", True, "npm run lint"),
+        ("pnpm test", True, "pnpm test"),
+        ("pnpm run test", True, "pnpm run test"),
+        ("yarn test", True, "yarn test"),
+        ("yarn run lint", True, "yarn run lint"),
+        ("bun test", True, "bun test"),
+        ("bun run test", True, "bun run test"),
+        ("npm run typecheck", True, "npm run typecheck"),
+        ("npm run verify", True, "npm run verify"),
+        ("npm run ci", True, "npm run ci"),
+
+        # ── Layer 5: TODO scans ───────────────────────────────────
+        ("grep -r TODO src/", True, "grep TODO"),
+        ("rg -i fixme .", True, "rg fixme"),
+        ("find . -name '*.py' | xargs grep TODO", True, "find + TODO"),
+        ("ag HACK src/", True, "ag HACK"),
+        ("git grep -i xxx", True, "git grep xxx"),
+        ("grep -rn 'FIXME\\|HACK' --include='*.py'", True, "grep FIXME|HACK"),
+
+        # ── Runner stripping ─────────────────────────────────────
+        ("uv run pytest", True, "uv run pytest"),
+        ("poetry run pytest -v", True, "poetry run pytest"),
+        ("pipenv run python -m pytest", True, "pipenv run python -m pytest"),
+        ("npx jest --coverage", True, "npx jest"),
+        ("npx vitest run", True, "npx vitest"),
+        ("npx eslint .", True, "npx eslint"),
+        ("npx tsc --noEmit", True, "npx tsc --noEmit"),
+        ("pnpm exec jest", True, "pnpm exec jest"),
+
+        # ── SAFETY: Must NOT match ────────────────────────────────
+        ("ls -la", False, "ls"),
+        ("echo 'hello world'", False, "echo"),
+        ("pwd", False, "pwd"),
+        ("cd /tmp", False, "cd"),
+        ("mkdir -p foo/bar", False, "mkdir"),
+        ("rm -rf node_modules", False, "rm"),
+        ("cp file1 file2", False, "cp"),
+        ("mv old new", False, "mv"),
+        ("cat README.md", False, "cat"),
+        ("head -20 file.txt", False, "head"),
+        ("tail -f log.txt", False, "tail"),
+        ("git status", False, "git status"),
+        ("git diff --cached", False, "git diff"),
+        ("git log --oneline", False, "git log"),
+        ("npm install", False, "npm install"),
+        ("npm run build", False, "npm run build"),
+        ("npm run dev", False, "npm run dev"),
+        ("npm run start", False, "npm run start"),
+        ("pip install pytest", False, "pip install"),
+        ("pip3 freeze", False, "pip3 freeze"),
+        ("docker ps", False, "docker ps"),
+        ("whoami", False, "whoami"),
+        ("clear", False, "clear"),
+        ("python main.py", False, "python main.py (no test)"),
+        ("python server.py", False, "python server.py"),
+        ("python contest.py", False, "contest (test substring)"),
+        ("python latest.py", False, "latest (test substring)"),
+        ("python testing.py", False, "testing (no boundary)"),
+        ("node server.js", False, "node server.js"),
+        ("node index.js", False, "node index.js"),
+        ("npx create-react-app my-app", False, "npx non-test tool"),
+        ("make build", False, "make build (not test/check)"),
+    ]
+
+    print("=" * 62)
+    print("  分类器单元测试: is_verification_command()")
+    print("=" * 62)
+
+    passed = 0
+    failed = 0
+    for cmd, expected, desc in cases:
+        ok, cat = is_verif(cmd)
+        if ok == expected:
+            passed += 1
+        else:
+            failed += 1
+            verdict = "VERIFY" if ok else "NOT"
+            exp_str = "VERIFY" if expected else "NOT"
+            print(f"  FAIL: [{desc}] cmd={cmd!r}")
+            print(f"        expected={exp_str}  got={verdict}  category={cat!r}")
+
+    print(f"\n  结果: {passed} 通过, {failed} 失败 (共 {len(cases)} 项)")
+    if failed > 0:
+        print("  ⚠️  存在失败用例，请检查！")
+    else:
+        print("  ✅ 所有分类器单元测试通过")
+    print("=" * 62)
+    print()
 
 
 if __name__ == "__main__":

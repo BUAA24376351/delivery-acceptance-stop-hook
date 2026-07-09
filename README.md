@@ -155,13 +155,17 @@ cp .claude/settings.local.example.json .claude/settings.local.json
 
 ## 可识别的验证命令
 
-| 类别 | 工具 |
-|------|------|
-| 测试框架 | pytest、npm test、go test、cargo test、jest、mocha、unittest、tox、nosetests |
-| 代码检查 | ruff check、flake8、pylint、eslint、black --check |
-| 类型检查 | mypy、pyright、tsc --noEmit |
-| TODO 扫描 | grep/rg/ag/ack/find 配合 TODO/FIXME 关键词 |
-| 基础验证 | `python -c`（内联语法/导入检查）、`node --check` |
+Hook 使用 **5 层分类器**（非扁平白名单）识别验证命令：
+
+| 层级 | 检测方式 | 示例 |
+|------|---------|------|
+| **Layer 1** — 已知工具 | 40+ 测试/lint/类型检查工具名 | `pytest`, `jest`, `ruff check`, `mypy`, `go test`, `cargo test`, `deno test` |
+| **Layer 2** — 测试文件执行 | 文件名含 "test" 作为词边界 | `python test_*.py`, `python -m unittest`, `node *.test.js`, `node *.spec.js` |
+| **Layer 3** — 内联验证 | 解释器 + 验证标志 | `python -c "..."`, `node --check`, `node -e "..."`, `ruby -c`, `perl -c` |
+| **Layer 4** — 包管理器脚本 | `<pm> test` / `<pm> run <script>` | `npm test`, `pnpm test`, `yarn test`, `bun test`, `make test` |
+| **Layer 5** — TODO 扫描 | 搜索工具 + 关键词 | `grep -r TODO`, `rg -i fixme`, `git grep xxx`, `ag HACK` |
+
+此外，命令前缀（`uv run`, `poetry run`, `pipenv run`, `npx`, `pnpm exec`）会被自动剥离后递归识别。例如 `uv run pytest` → 剥离 `uv run` → `pytest` → Layer 1 匹配。
 
 ## 项目目录结构
 
@@ -191,9 +195,10 @@ your-project/
    — 快照在每次扫描后立即写回。这意味着同一会话内重试时，
    文件扫描层不会再检测到同一个变更；会话记录回退层会补上这个缺口。
 
-4. **标记匹配是子串/正则匹配，而非结构化 JSONL 解析。**
-   — 所有验证模式匹配原始转小写文本。这避免引入 JSONL 解析器，
-   但理论上可能在极端情况下产生假匹配。实际测试中未发现此类案例。
+4. **验证检测使用结构化 JSONL 解析 + 5 层分类器，而非原始字符串匹配。**
+   — 会话记录中的 Bash 命令通过 JSONL 解析提取（兼容扁平格式和嵌套
+   `message.content` 格式），然后使用 `is_verification_command()` 分层
+   分类。相比旧版的扁平白名单，覆盖面更广且误匹配率更低。
 
 ## 维护笔记
 
